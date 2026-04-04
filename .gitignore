@@ -1,0 +1,10 @@
+# Financial data files
+*.pdf
+*.csv
+*.db
+
+# Rust build output
+/target
+
+# Environment variables 
+.env
