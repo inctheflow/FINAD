@@ -20,6 +20,73 @@ static RE: Lazy<Regex> = Lazy::new(|| {
     ).unwrap()
 });
 
+fn categorize(description: &str) -> String {
+    let rules: &[(&str, &str)] = &[
+        //(keyword to look for: category)
+        // Dining — restaurants and cafes
+        ("akira ramen",         "dining"),
+        ("swadesh",             "dining"),
+        ("kong",                "dining"),
+        ("tst*",                "dining"),      
+        ("potomac pizza",       "dining"),
+        ("lao sze chuan",       "dining"),
+        ("starbucks",           "dining"),
+        ("mcdonalds",           "dining"),
+        ("bakery momo",         "dining"),
+        ("tous les jours",      "dining"),       
+        ("spice",            "dining"),
+        ("py *kung fu tea",     "dining"),       
+
+        // Transport
+        ("uber *trip",          "transport"),
+
+        ("sunoco",              "fuel"),
+        ("gas","fuel"),         
+        ("1763 pf perry hall",  "fuel"),         
+
+        // Groceries
+        ("h mart",              "groceries"),    
+        ("safeway",             "groceries"),
+        ("walmart",             "groceries"),
+
+        // Shopping
+        ("macys",               "shopping"),
+        ("burlington",          "shopping"),
+
+        // Entertainment
+        ("bowlero",             "entertainment"), 
+        ("white marsh ice",     "entertainment"), 
+
+        // Recreation
+        ("gunpowder falls",     "recreation"),
+
+        // Education
+        ("ccbc essex",          "education"),   
+
+        // Automotive
+        ("auto diagnostic",     "automotive"),
+        ("tims automotive",     "automotive"),
+
+        // Bills & subscriptions
+        ("mint mobile",         "bills"),        
+
+        // Insurance
+        ("iso student health",  "insurance"),
+
+        // Memberships
+        ("bjs membership",      "memberships"),  
+
+    ];
+
+    let desc = description.to_lowercase();
+    for (keyword, category) in rules {
+        if desc.contains(keyword) {
+            return category.to_string();
+        }
+    }
+    "Others".to_string() //default category
+}
+
 fn read_pdf(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> {
 
     //using pdf extract 
@@ -33,12 +100,13 @@ fn read_pdf(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> 
         let date = cap[1].to_string();
         let description = cap[2].trim().to_string();
         let amount: f64 = cap[3].replace(",", "").parse()?;
+        let category = categorize(&description);
 
         let record = Record {
             date,
             amount,
             description,
-            category: "".to_string(), //catrgory to be assigned later
+            category, 
         };
 
         records.push(record);
@@ -51,7 +119,10 @@ fn read_csv(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> 
     let mut records = Vec::new();
 
     for result in reader.deserialize() {
-        let record: Record = result?;
+        let mut record: Record = result?;
+        if record.category.is_empty() {
+            record.category = categorize(&record.description);
+        }
         records.push(record);
     }
     Ok(records)
@@ -135,5 +206,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //for record in &pdf_data {
     //    println!("{:?}", record);
     //}
+
+    println!("\n Spendings by category: \n");
+    let mut stmt = conn.prepare(
+        "SELECT category, COUNT(*) as count,
+        ROUND(SUM(amount), 2) as total
+        FROM transactions GROUP BY 
+    category ORDER BY total DESC"
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?, //category
+            row.get::<_, i64>(1)?, //count
+            row.get::<_, f64>(2)?, //total
+
+        ))
+    })?;
+
+    for row in rows {
+        let (cat, count, total) = row?;
+        println!("  {:<20} {:>3} transactions   ${:.2}", cat, count, total);
+    }
+
     Ok(())
 }
