@@ -134,6 +134,7 @@ async fn health() -> impl IntoResponse {
     Json(json!({"status": "ok"}))
 }
 
+// Apple Card: DATE  DESCRIPTION  XX%  $CASHBACK  $AMOUNT
 static RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(\d{2}/\d{2}/\d{4})\s+([A-Z0-9 \*\.\-]+?)\s+\d+%\s+\$[\d\.]+\s+\$(-?[\d\.]+)",
@@ -141,8 +142,26 @@ static RE: Lazy<Regex> = Lazy::new(|| {
     .unwrap()
 });
 
+// Discover: MM/DD/YY  MM/DD/YY  DESCRIPTION (may wrap lines)  $  AMOUNT
+static RE_DISCOVER: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?s)(\d{2}/\d{2}/\d{2})\s+\d{2}/\d{2}/\d{2}\s+(.+?)\$\s+(-?[\d,]+\.\d{2})",
+    )
+    .unwrap()
+});
+
+fn discover_date(date: &str) -> String {
+    let parts: Vec<&str> = date.split('/').collect();
+    if parts.len() == 3 && parts[2].len() == 2 {
+        format!("{}/{}/20{}", parts[0], parts[1], parts[2])
+    } else {
+        date.to_string()
+    }
+}
+
 fn categorize(description: &str) -> String {
     let rules: &[(&str, &str)] = &[
+        // ── Dining ───────────────────────────────────────────────────────────
         ("akira ramen",         "dining"),
         ("swadesh",             "dining"),
         ("kong",                "dining"),
@@ -151,28 +170,253 @@ fn categorize(description: &str) -> String {
         ("lao sze chuan",       "dining"),
         ("starbucks",           "dining"),
         ("mcdonalds",           "dining"),
+        ("mcdonald",            "dining"),
         ("bakery momo",         "dining"),
         ("tous les jours",      "dining"),
         ("spice",               "dining"),
-        ("py *kung fu tea",     "dining"),
-        ("uber *trip",          "transport"),
-        ("sunoco",              "fuel"),
-        ("gas",                 "fuel"),
-        ("1763 pf perry hall",  "fuel"),
+        ("kung fu tea",         "dining"),
+        ("chipotle",            "dining"),
+        ("chick-fil-a",         "dining"),
+        ("chickfila",           "dining"),
+        ("subway",              "dining"),
+        ("panera",              "dining"),
+        ("domino",              "dining"),
+        ("pizza hut",           "dining"),
+        ("papa john",           "dining"),
+        ("taco bell",           "dining"),
+        ("burger king",         "dining"),
+        ("wendy",               "dining"),
+        ("dunkin",              "dining"),
+        ("doordash",            "dining"),
+        ("grubhub",             "dining"),
+        ("ubereats",            "dining"),
+        ("uber eats",           "dining"),
+        ("noodle",              "dining"),
+        ("sushi",               "dining"),
+        ("ramen",               "dining"),
+        ("pho",                 "dining"),
+        ("bbq",                 "dining"),
+        ("grill",               "dining"),
+        ("diner",               "dining"),
+        ("cafe",                "dining"),
+        ("coffee",              "dining"),
+        ("bakery",              "dining"),
+        ("boba",                "dining"),
+        ("smoothie",            "dining"),
+        ("restaurant",          "dining"),
+        ("eatery",              "dining"),
+        ("kitchen",             "dining"),
+        ("bar & grill",         "dining"),
+        // ── Groceries ────────────────────────────────────────────────────────
         ("h mart",              "groceries"),
+        ("hmart",               "groceries"),
         ("safeway",             "groceries"),
         ("walmart",             "groceries"),
+        ("target",              "groceries"),
+        ("costco",              "groceries"),
+        ("bjs",                 "groceries"),
+        ("whole foods",         "groceries"),
+        ("trader joe",          "groceries"),
+        ("aldi",                "groceries"),
+        ("kroger",              "groceries"),
+        ("giant",               "groceries"),
+        ("food lion",           "groceries"),
+        ("harris teeter",       "groceries"),
+        ("weis",                "groceries"),
+        ("lidl",                "groceries"),
+        ("fresh market",        "groceries"),
+        ("sprouts",             "groceries"),
+        ("instacart",           "groceries"),
+        // ── Fuel ─────────────────────────────────────────────────────────────
+        ("sunoco",              "fuel"),
+        ("1763 pf perry hall",  "fuel"),
+        ("exxon",               "fuel"),
+        ("mobil",               "fuel"),
+        ("shell",               "fuel"),
+        ("bp",                  "fuel"),
+        ("chevron",             "fuel"),
+        ("wawa",                "fuel"),
+        ("sheetz",              "fuel"),
+        ("7-eleven",            "fuel"),
+        ("7eleven",             "fuel"),
+        ("gas station",         "fuel"),
+        ("fuel",                "fuel"),
+        // ── Transport ────────────────────────────────────────────────────────
+        ("uber *trip",          "transport"),
+        ("uber* trip",          "transport"),
+        ("lyft",                "transport"),
+        ("metro",               "transport"),
+        ("mta",                 "transport"),
+        ("transit",             "transport"),
+        ("parking",             "transport"),
+        ("toll",                "transport"),
+        ("zipcar",              "transport"),
+        ("amtrak",              "transport"),
+        ("greyhound",           "transport"),
+        ("airline",             "transport"),
+        ("united air",          "transport"),
+        ("delta air",           "transport"),
+        ("southwest air",       "transport"),
+        ("american air",        "transport"),
+        ("spirit air",          "transport"),
+        // ── Shopping ─────────────────────────────────────────────────────────
         ("macys",               "shopping"),
+        ("macy",                "shopping"),
         ("burlington",          "shopping"),
+        ("amazon",              "shopping"),
+        ("amzn",                "shopping"),
+        ("ebay",                "shopping"),
+        ("etsy",                "shopping"),
+        ("bestbuy",             "shopping"),
+        ("best buy",            "shopping"),
+        ("apple store",         "shopping"),
+        ("apple.com",           "shopping"),
+        ("walmart.com",         "shopping"),
+        ("target.com",          "shopping"),
+        ("tjmaxx",              "shopping"),
+        ("t.j. maxx",           "shopping"),
+        ("marshalls",           "shopping"),
+        ("ross ",               "shopping"),
+        ("nordstrom",           "shopping"),
+        ("h&m",                 "shopping"),
+        ("zara",                "shopping"),
+        ("gap",                 "shopping"),
+        ("old navy",            "shopping"),
+        ("forever 21",          "shopping"),
+        ("nike",                "shopping"),
+        ("adidas",              "shopping"),
+        ("foot locker",         "shopping"),
+        ("chewy",               "shopping"),
+        ("wayfair",             "shopping"),
+        // ── Entertainment ────────────────────────────────────────────────────
         ("bowlero",             "entertainment"),
         ("white marsh ice",     "entertainment"),
+        ("netflix",             "entertainment"),
+        ("hulu",                "entertainment"),
+        ("disney",              "entertainment"),
+        ("hbo",                 "entertainment"),
+        ("spotify",             "entertainment"),
+        ("apple music",         "entertainment"),
+        ("youtube",             "entertainment"),
+        ("twitch",              "entertainment"),
+        ("steam",               "entertainment"),
+        ("playstation",         "entertainment"),
+        ("xbox",                "entertainment"),
+        ("nintendo",            "entertainment"),
+        ("amc",                 "entertainment"),
+        ("regal",               "entertainment"),
+        ("cinemark",            "entertainment"),
+        ("movie",               "entertainment"),
+        ("concert",             "entertainment"),
+        ("ticketmaster",        "entertainment"),
+        ("eventbrite",          "entertainment"),
+        ("stubhub",             "entertainment"),
+        // ── Recreation ───────────────────────────────────────────────────────
         ("gunpowder falls",     "recreation"),
+        ("gym",                 "recreation"),
+        ("planet fitness",      "recreation"),
+        ("la fitness",          "recreation"),
+        ("equinox",             "recreation"),
+        ("crunch",              "recreation"),
+        ("ymca",                "recreation"),
+        ("peloton",             "recreation"),
+        ("rei ",                "recreation"),
+        ("dick's sporting",     "recreation"),
+        ("dicks sporting",      "recreation"),
+        ("golf",                "recreation"),
+        ("tennis",              "recreation"),
+        ("swimming",            "recreation"),
+        // ── Education ────────────────────────────────────────────────────────
         ("ccbc essex",          "education"),
+        ("ccbc",                "education"),
+        ("university",          "education"),
+        ("college",             "education"),
+        ("coursera",            "education"),
+        ("udemy",               "education"),
+        ("chegg",               "education"),
+        ("duolingo",            "education"),
+        ("khan academy",        "education"),
+        ("barnes & noble",      "education"),
+        ("book",                "education"),
+        // ── Bills & Utilities ────────────────────────────────────────────────
+        ("mint mobile",         "bills"),
+        ("at&t",                "bills"),
+        ("verizon",             "bills"),
+        ("t-mobile",            "bills"),
+        ("tmobile",             "bills"),
+        ("comcast",             "bills"),
+        ("xfinity",             "bills"),
+        ("cox ",                "bills"),
+        ("spectrum",            "bills"),
+        ("bge",                 "bills"),
+        ("pepco",               "bills"),
+        ("electric",            "bills"),
+        ("utility",             "bills"),
+        ("water bill",          "bills"),
+        ("internet",            "bills"),
+        ("rent",                "bills"),
+        ("mortgage",            "bills"),
+        // ── Insurance ────────────────────────────────────────────────────────
+        ("iso student health",  "insurance"),
+        ("geico",               "insurance"),
+        ("progressive",         "insurance"),
+        ("state farm",          "insurance"),
+        ("allstate",            "insurance"),
+        ("usaa",                "insurance"),
+        ("cigna",               "insurance"),
+        ("aetna",               "insurance"),
+        ("bluecross",           "insurance"),
+        ("blue cross",          "insurance"),
+        ("insurance",           "insurance"),
+        // ── Memberships & Subscriptions ──────────────────────────────────────
+        ("bjs membership",      "memberships"),
+        ("costco membership",   "memberships"),
+        ("amazon prime",        "memberships"),
+        ("prime video",         "memberships"),
+        ("apple one",           "memberships"),
+        ("icloud",              "memberships"),
+        ("google one",          "memberships"),
+        ("dropbox",             "memberships"),
+        ("microsoft 365",       "memberships"),
+        ("adobe",               "memberships"),
+        ("patreon",             "memberships"),
+        // ── Health & Pharmacy ────────────────────────────────────────────────
+        ("cvs",                 "health"),
+        ("walgreens",           "health"),
+        ("rite aid",            "health"),
+        ("pharmacy",            "health"),
+        ("doctor",              "health"),
+        ("dental",              "health"),
+        ("vision",              "health"),
+        ("hospital",            "health"),
+        ("clinic",              "health"),
+        ("urgent care",         "health"),
+        ("lab corp",            "health"),
+        ("quest diag",          "health"),
+        // ── Automotive ───────────────────────────────────────────────────────
         ("auto diagnostic",     "automotive"),
         ("tims automotive",     "automotive"),
-        ("mint mobile",         "bills"),
-        ("iso student health",  "insurance"),
-        ("bjs membership",      "memberships"),
+        ("jiffy lube",          "automotive"),
+        ("midas",               "automotive"),
+        ("valvoline",           "automotive"),
+        ("autozone",            "automotive"),
+        ("advance auto",        "automotive"),
+        ("o'reilly",            "automotive"),
+        ("car wash",            "automotive"),
+        ("dmv",                 "automotive"),
+        ("pep boys",            "automotive"),
+        // ── Travel ───────────────────────────────────────────────────────────
+        ("airbnb",              "travel"),
+        ("hotel",               "travel"),
+        ("marriott",            "travel"),
+        ("hilton",              "travel"),
+        ("hyatt",               "travel"),
+        ("expedia",             "travel"),
+        ("booking.com",         "travel"),
+        ("vrbo",                "travel"),
+        ("hertz",               "travel"),
+        ("enterprise rent",     "travel"),
+        ("avis",                "travel"),
     ];
     let desc = description.to_lowercase();
     for (keyword, category) in rules {
@@ -183,39 +427,57 @@ fn categorize(description: &str) -> String {
     "Others".to_string()
 }
 
-// ── Gemini helpers ────────────────────────────────────────────────────────────
+// ── Claude (Anthropic) helpers ────────────────────────────────────────────────
 
-async fn gemini_api_call(prompt: String) -> Result<String, String> {
-    let api_key = env::var("GEMINI_API_KEY")
-        .map_err(|_| "GEMINI_API_KEY not set".to_string())?;
-
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
-        api_key
-    );
+async fn claude_api_call(prompt: String) -> Result<String, String> {
+    let api_key = env::var("ANTHROPIC_API_KEY").map_err(|_| {
+        let e = "ANTHROPIC_API_KEY not set — check your .env file".to_string();
+        eprintln!("[Claude] {}", e);
+        e
+    })?;
 
     let body = json!({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1}
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": prompt}]
     });
 
-    let response: serde_json::Value = reqwest::Client::new()
-        .post(&url)
+    let raw_response = reqwest::Client::new()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", &api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
         .json(&body)
         .send()
         .await
-        .map_err(|e| e.to_string())?
+        .map_err(|e| { eprintln!("[Claude] HTTP error: {}", e); e.to_string() })?;
+
+    let status = raw_response.status();
+    let response: serde_json::Value = raw_response
         .json()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| { eprintln!("[Claude] Failed to parse response: {}", e); e.to_string() })?;
 
-    response["candidates"][0]["content"]["parts"][0]["text"]
+    if !status.is_success() {
+        let err = format!("Claude API error {}: {}", status, response);
+        eprintln!("[Claude] {}", err);
+        return Err(err);
+    }
+
+    let text = response["content"][0]["text"]
         .as_str()
-        .ok_or_else(|| "Empty Gemini response".to_string())
-        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let err = format!("Unexpected Claude response shape: {}", response);
+            eprintln!("[Claude] {}", err);
+            err
+        })?
+        .to_string();
+
+    eprintln!("[Claude] OK — {} chars returned", text.len());
+    Ok(text)
 }
 
-/// Strip markdown code fences Gemini sometimes wraps JSON in.
+/// Strip markdown code fences Claude sometimes wraps JSON in.
 fn strip_code_fences(s: &str) -> &str {
     s.trim()
         .trim_start_matches("```json")
@@ -224,8 +486,8 @@ fn strip_code_fences(s: &str) -> &str {
         .trim()
 }
 
-/// Use Gemini to extract transactions from any bank statement text.
-async fn gemini_extract_transactions(text: &str) -> Vec<Record> {
+/// Use Claude to extract transactions from any bank statement text.
+async fn claude_extract_transactions(text: &str) -> Result<Vec<Record>, String> {
     let truncated = &text[..text.len().min(20_000)];
     let prompt = format!(
         "You are a financial data extractor. From the bank/credit card statement below, \
@@ -240,10 +502,10 @@ async fn gemini_extract_transactions(text: &str) -> Vec<Record> {
         truncated
     );
 
-    match gemini_api_call(prompt).await {
+    match claude_api_call(prompt).await {
         Ok(raw) => {
             let cleaned = strip_code_fences(&raw);
-            serde_json::from_str::<Vec<serde_json::Value>>(cleaned)
+            let records = serde_json::from_str::<Vec<serde_json::Value>>(cleaned)
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|v| {
@@ -258,14 +520,15 @@ async fn gemini_extract_transactions(text: &str) -> Vec<Record> {
                     let category = categorize(&description);
                     Some(Record { date, description, amount, category })
                 })
-                .collect()
+                .collect();
+            Ok(records)
         }
-        Err(_) => Vec::new(),
+        Err(e) => Err(e),
     }
 }
 
 /// Get AI financial tips based on spending data.
-async fn gemini_tips(spending_data: &str) -> Vec<String> {
+async fn claude_tips(spending_data: &str) -> Vec<String> {
     let prompt = format!(
         "Based on this spending data:\n{}\n\n\
          Give exactly 3 specific, actionable financial tips. \
@@ -274,7 +537,7 @@ async fn gemini_tips(spending_data: &str) -> Vec<String> {
         spending_data
     );
 
-    match gemini_api_call(prompt).await {
+    match claude_api_call(prompt).await {
         Ok(raw) => {
             let cleaned = strip_code_fences(&raw);
             serde_json::from_str::<Vec<String>>(cleaned).unwrap_or_default()
@@ -311,12 +574,12 @@ fn read_csv(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> 
     Ok(records)
 }
 
-/// Try the Apple Card regex first; fall back to Gemini for any other format.
+/// Try known bank regexes first; fall back to Gemini for any other format.
 async fn extract_records(file_path: &str) -> Result<Vec<Record>, String> {
     let text = pdf_extract::extract_text(file_path).map_err(|e| e.to_string())?;
 
-    // Fast path: Apple Card regex
-    let regex_records: Vec<Record> = RE
+    // Fast path 1: Apple Card regex
+    let apple_records: Vec<Record> = RE
         .captures_iter(&text)
         .filter_map(|cap| {
             let amount: f64 = cap[3].replace(",", "").parse().ok()?;
@@ -327,12 +590,31 @@ async fn extract_records(file_path: &str) -> Result<Vec<Record>, String> {
         })
         .collect();
 
-    if !regex_records.is_empty() {
-        return Ok(regex_records);
+    if !apple_records.is_empty() {
+        return Ok(apple_records);
     }
 
-    // Slow path: ask Gemini to understand any other bank format
-    Ok(gemini_extract_transactions(&text).await)
+    // Fast path 2: Discover Account Activity regex
+    let discover_records: Vec<Record> = RE_DISCOVER
+        .captures_iter(&text)
+        .filter_map(|cap| {
+            let amount: f64 = cap[3].replace(",", "").parse().ok()?;
+            if amount <= 0.0 { return None; }
+            // Collapse multi-line descriptions into a single string
+            let description = cap[2].split_whitespace().collect::<Vec<_>>().join(" ");
+            let category = categorize(&description);
+            let date = discover_date(&cap[1]);
+            Some(Record { date, amount, description, category })
+        })
+        .collect();
+
+    if !discover_records.is_empty() {
+        return Ok(discover_records);
+    }
+
+    // Slow path: ask Claude to understand any other bank format
+    eprintln!("[PDF] No regex matched. Extracted text (first 500 chars):\n{}", &text[..text.len().min(500)]);
+    claude_extract_transactions(&text).await
 }
 
 // ── Database setup ────────────────────────────────────────────────────────────
@@ -546,6 +828,27 @@ fn build_summary(conn: &Connection, user_id: i64) -> Result<String, Box<dyn std:
     Ok(summary)
 }
 
+// ── Debug endpoint ────────────────────────────────────────────────────────────
+
+async fn test_claude() -> impl IntoResponse {
+    let key = env::var("ANTHROPIC_API_KEY").unwrap_or_else(|_| "NOT SET".to_string());
+    let key_preview = if key == "NOT SET" {
+        "NOT SET".to_string()
+    } else {
+        format!("{}...{}", &key[..4.min(key.len())], &key[key.len().saturating_sub(4)..])
+    };
+
+    let status = match claude_api_call("Say 'ok' and nothing else.".to_string()).await {
+        Ok(_) => "reachable".to_string(),
+        Err(e) => format!("error: {}", e),
+    };
+
+    (StatusCode::OK, Json(json!({
+        "key_preview": key_preview,
+        "status": status,
+    })))
+}
+
 // ── Auth handlers ─────────────────────────────────────────────────────────────
 
 async fn register(
@@ -687,8 +990,8 @@ async fn upload(
 
     let message = if count == 0 {
         format!(
-            "No transactions found in {}. If this isn't an Apple Card statement, \
-             make sure GEMINI_API_KEY is set — Gemini is used to parse other formats.",
+            "No transactions found in {}. If this isn't an Apple Card or Discover statement, \
+             make sure ANTHROPIC_API_KEY is set — Claude is used to parse other formats.",
             file_name
         )
     } else {
@@ -773,7 +1076,7 @@ async fn get_analytics(auth: AuthUser, State(state): State<AppState>) -> impl In
 
     // ── Phase 2: Gemini tips (no lock held) ──────────────────────────────────
     let tips = if spending_text.contains('$') {
-        gemini_tips(&spending_text).await
+        claude_tips(&spending_text).await
     } else {
         Vec::new()
     };
@@ -878,6 +1181,7 @@ async fn delete_cash_entry(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok(); // load .env if present
     let conn = create_db()?;
 
     let args: Vec<String> = env::args().collect();
@@ -903,6 +1207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = Router::new()
         .route("/health",       get(health))
+        .route("/test-claude",  get(test_claude))
         .route("/register",     post(register))
         .route("/login",        post(login))
         .route("/summary",      get(get_summary))
