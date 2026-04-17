@@ -44,6 +44,24 @@ struct AuthRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+struct ChatRequest {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct AccountUpdateRequest {
+    phone: Option<String>,
+    security_question: Option<String>,
+    security_answer: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordRequest {
+    current_password: String,
+    new_password: String,
+}
+
 struct AuthUser {
     user_id: i64,
 }
@@ -527,25 +545,6 @@ async fn claude_extract_transactions(text: &str) -> Result<Vec<Record>, String> 
     }
 }
 
-/// Get AI financial tips based on spending data.
-async fn claude_tips(spending_data: &str) -> Vec<String> {
-    let prompt = format!(
-        "Based on this spending data:\n{}\n\n\
-         Give exactly 3 specific, actionable financial tips. \
-         Mention actual amounts or categories where relevant. \
-         Return ONLY a JSON array of 3 strings. No markdown.",
-        spending_data
-    );
-
-    match claude_api_call(prompt).await {
-        Ok(raw) => {
-            let cleaned = strip_code_fences(&raw);
-            serde_json::from_str::<Vec<String>>(cleaned).unwrap_or_default()
-        }
-        Err(_) => Vec::new(),
-    }
-}
-
 // ── PDF parsing ───────────────────────────────────────────────────────────────
 
 fn read_pdf(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> {
@@ -656,6 +655,11 @@ fn create_db() -> Result<Connection, Box<dyn std::error::Error>> {
         )",
         [],
     )?;
+
+    // Add new user profile columns (safe to call repeatedly — errors ignored)
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN phone TEXT", []);
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN security_question TEXT", []);
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN security_answer TEXT", []);
 
     // Detect and fix the old UNIQUE(date, description, amount) constraint
     // that excludes user_id — causes INSERT OR IGNORE to silently discard uploads.
@@ -1005,7 +1009,7 @@ async fn upload(
 /// Collects DB data first (lock held briefly), then calls Gemini (no lock).
 async fn get_analytics(auth: AuthUser, State(state): State<AppState>) -> impl IntoResponse {
     // ── Phase 1: query DB ─────────────────────────────────────────────────────
-    let (monthly_avg, top_expenses, spending_text) = {
+    let (monthly_avg, top_expenses, _spending_text) = {
         let conn = state.lock().unwrap();
 
         let monthly_avg: f64 = conn
@@ -1074,21 +1078,128 @@ async fn get_analytics(auth: AuthUser, State(state): State<AppState>) -> impl In
         // lock released here
     };
 
-    // ── Phase 2: Gemini tips (no lock held) ──────────────────────────────────
-    let tips = if spending_text.contains('$') {
-        claude_tips(&spending_text).await
-    } else {
-        Vec::new()
-    };
-
     (
         StatusCode::OK,
         Json(json!({
             "monthly_average": monthly_avg,
             "top_expenses": top_expenses,
-            "tips": tips,
         })),
     )
+}
+
+// ── AI chat handler ───────────────────────────────────────────────────────────
+
+async fn chat(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<ChatRequest>,
+) -> impl IntoResponse {
+    let context = {
+        let conn = state.lock().unwrap();
+        build_summary(&conn, auth.user_id).unwrap_or_else(|_| "No transaction data available.".to_string())
+    };
+
+    let prompt = format!(
+        "You are a personal finance assistant. Here is the user's spending summary:\n{}\n\n\
+         Answer the user's question concisely and helpfully. \
+         Do not add any prefix or label to your response.\n\n\
+         User: {}",
+        context, body.message
+    );
+
+    match claude_api_call(prompt).await {
+        Ok(reply) => (StatusCode::OK, Json(json!({"reply": reply}))),
+        Err(e)    => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
+    }
+}
+
+// ── Account handlers ──────────────────────────────────────────────────────────
+
+async fn get_account(auth: AuthUser, State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.lock().unwrap();
+    match conn.query_row(
+        "SELECT email, phone, security_question FROM users WHERE id = ?1",
+        params![auth.user_id],
+        |row| Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        )),
+    ) {
+        Ok((email, phone, security_question)) => (
+            StatusCode::OK,
+            Json(json!({ "email": email, "phone": phone, "security_question": security_question })),
+        ),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+async fn update_account(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<AccountUpdateRequest>,
+) -> impl IntoResponse {
+    let conn = state.lock().unwrap();
+
+    if let Some(ref phone) = body.phone {
+        if let Err(e) = conn.execute(
+            "UPDATE users SET phone = ?1 WHERE id = ?2",
+            params![phone, auth.user_id],
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})));
+        }
+    }
+
+    if let (Some(ref question), Some(ref answer)) = (body.security_question, body.security_answer) {
+        let answer_hash = match hash(answer, DEFAULT_COST) {
+            Ok(h) => h,
+            Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to hash answer"}))),
+        };
+        if let Err(e) = conn.execute(
+            "UPDATE users SET security_question = ?1, security_answer = ?2 WHERE id = ?3",
+            params![question, answer_hash, auth.user_id],
+        ) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})));
+        }
+    }
+
+    (StatusCode::OK, Json(json!({"message": "Account updated"})))
+}
+
+async fn change_password(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<ChangePasswordRequest>,
+) -> impl IntoResponse {
+    let conn = state.lock().unwrap();
+
+    let current_hash: String = match conn.query_row(
+        "SELECT password_hash FROM users WHERE id = ?1",
+        params![auth.user_id],
+        |row| row.get(0),
+    ) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    };
+
+    match verify(&body.current_password, &current_hash) {
+        Ok(true)  => {}
+        Ok(false) => return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Current password is incorrect"}))),
+        Err(_)    => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Password verification failed"}))),
+    }
+
+    let new_hash = match hash(&body.new_password, DEFAULT_COST) {
+        Ok(h) => h,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "Failed to hash password"}))),
+    };
+
+    match conn.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+        params![new_hash, auth.user_id],
+    ) {
+        Ok(_)  => (StatusCode::OK, Json(json!({"message": "Password changed successfully"}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
 }
 
 // ── Cash entry handlers ───────────────────────────────────────────────────────
@@ -1214,8 +1325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/transactions", get(get_transactions))
         .route("/upload",       post(upload))
         .route("/analytics",    get(get_analytics))
-        .route("/cash",         post(add_cash_entry).get(get_cash_entries))
-        .route("/cash/{id}",    axum::routing::delete(delete_cash_entry))
+        .route("/chat",              post(chat))
+        .route("/account",           get(get_account).put(update_account))
+        .route("/account/password",  axum::routing::put(change_password))
+        .route("/cash",              post(add_cash_entry).get(get_cash_entries))
+        .route("/cash/{id}",         axum::routing::delete(delete_cash_entry))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
