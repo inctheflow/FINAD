@@ -18,5 +18,5 @@ tower-http = { version = "0.6.8", features = ["cors"] }
 bcrypt = "0.15"
 jsonwebtoken = "9"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 dotenvy = "0.15"

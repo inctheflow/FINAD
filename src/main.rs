@@ -127,6 +127,25 @@ struct TopExpense {
     category: String,
 }
 
+// ── Teller structs ────────────────────────────────────────────────────────────
+
+/// Sent by the frontend after the user completes the Teller Connect OAuth flow.
+#[derive(Deserialize)]
+struct TellerEnrollRequest {
+    access_token: String,   // from Teller Connect onSuccess callback
+    enrollment_id: String,  // enrollment.id from the same callback
+    institution_name: String,
+}
+
+#[derive(Serialize)]
+struct TellerAccountRow {
+    id: i64,
+    institution_name: String,
+    account_name: String,
+    account_type: String,
+    last_four: Option<String>,
+}
+
 // ── Cash entry structs ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -616,6 +635,350 @@ async fn extract_records(file_path: &str) -> Result<Vec<Record>, String> {
     claude_extract_transactions(&text).await
 }
 
+// ── Teller helpers ────────────────────────────────────────────────────────────
+
+const TELLER_API: &str = "https://api.teller.io";
+
+/// Builds an HTTP client with optional mTLS client certificate.
+/// Sandbox works without certs. Development/Production require them.
+/// Set TELLER_CERT_PATH and TELLER_KEY_PATH in .env for non-sandbox use.
+fn teller_http_client() -> reqwest::Client {
+    let cert_path = env::var("TELLER_CERT_PATH").ok();
+    let key_path  = env::var("TELLER_KEY_PATH").ok();
+
+    let mut builder = reqwest::Client::builder();
+
+    if let (Some(cp), Some(kp)) = (cert_path, key_path) {
+        match (std::fs::read(&cp), std::fs::read(&kp)) {
+            (Ok(mut cert_pem), Ok(key_pem)) => {
+                // reqwest::Identity::from_pem expects cert + key concatenated
+                cert_pem.push(b'\n');
+                cert_pem.extend_from_slice(&key_pem);
+                match reqwest::Identity::from_pem(&cert_pem) {
+                    Ok(identity) => { builder = builder.identity(identity); }
+                    Err(e) => eprintln!("[Teller] Failed to load client cert: {}", e),
+                }
+            }
+            _ => eprintln!("[Teller] Could not read TELLER_CERT_PATH / TELLER_KEY_PATH"),
+        }
+    }
+
+    builder.build().unwrap_or_default()
+}
+
+/// GET /accounts — list all accounts for this enrollment's access token.
+async fn teller_get_accounts_api(access_token: &str) -> Result<Vec<serde_json::Value>, String> {
+    let resp = teller_http_client()
+        .get(format!("{}/accounts", TELLER_API))
+        .basic_auth(access_token, Some(""))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status();
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    if !status.is_success() {
+        return Err(format!("Teller accounts error {}: {}", status, data));
+    }
+
+    Ok(data.as_array().cloned().unwrap_or_default())
+}
+
+/// GET /accounts/{id}/transactions — paginated fetch stopping at `since_id`.
+/// Returns (records, newest_transaction_id_seen).
+/// Teller convention: negative amount = debit (expense), positive = credit (skip).
+async fn teller_fetch_transactions(
+    access_token: &str,
+    account_id: &str,
+    since_id: Option<&str>,
+) -> Result<(Vec<Record>, Option<String>), String> {
+    let http = teller_http_client();
+    let mut all_records: Vec<Record> = Vec::new();
+    let mut from_id: Option<String> = None; // pagination cursor (oldest ID on last page)
+    let mut newest_id: Option<String> = None; // newest transaction seen this sync
+
+    loop {
+        let mut req = http
+            .get(format!("{}/accounts/{}/transactions", TELLER_API, account_id))
+            .basic_auth(access_token, Some(""))
+            .query(&[("count", "100")]);
+
+        if let Some(ref fid) = from_id {
+            req = req.query(&[("from_id", fid.as_str())]);
+        }
+
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        if !status.is_success() {
+            return Err(format!("Teller transactions error {}: {}", status, data));
+        }
+
+        let page = match data.as_array() {
+            Some(a) if !a.is_empty() => a.clone(),
+            _ => break,
+        };
+
+        let page_len = page.len();
+        let mut oldest_id_this_page: Option<String> = None;
+        let mut stop = false;
+
+        for txn in &page {
+            let id = txn["id"].as_str().unwrap_or("").to_string();
+
+            // Track the newest transaction ID (first on first page)
+            if newest_id.is_none() {
+                newest_id = Some(id.clone());
+            }
+
+            // Stop if we've reached the last transaction we already have
+            if since_id.map(|s| s == id).unwrap_or(false) {
+                stop = true;
+                break;
+            }
+
+            oldest_id_this_page = Some(id.clone());
+
+            // Teller: negative = debit/expense, positive = credit/income — skip credits
+            let amount: f64 = txn["amount"]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+            if amount >= 0.0 { continue; }
+            let amount = amount.abs();
+
+            // Date: YYYY-MM-DD → MM/DD/YYYY
+            let date = match txn["date"].as_str() {
+                Some(d) => {
+                    let p: Vec<&str> = d.split('-').collect();
+                    if p.len() == 3 { format!("{}/{}/{}", p[1], p[2], p[0]) }
+                    else { d.to_string() }
+                }
+                None => continue,
+            };
+
+            let description = txn["description"]
+                .as_str()
+                .unwrap_or("Unknown")
+                .to_uppercase();
+            let category = categorize(&description);
+            all_records.push(Record { date, amount, description, category });
+        }
+
+        if stop || page_len < 100 {
+            break; // caught up or no more pages
+        }
+
+        // from_id makes Teller return transactions OLDER than that ID
+        from_id = oldest_id_this_page;
+        if from_id.is_none() { break; }
+    }
+
+    Ok((all_records, newest_id))
+}
+
+// ── Teller handlers ───────────────────────────────────────────────────────────
+
+/// POST /teller/enroll
+/// Body: { "access_token": "...", "enrollment_id": "...", "institution_name": "Chase" }
+///
+/// Called by the frontend after the user completes Teller Connect. The frontend
+/// receives these values in the onSuccess callback and sends them here.
+/// The server then fetches and stores the user's bank accounts from Teller.
+async fn teller_enroll(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    Json(body): Json<TellerEnrollRequest>,
+) -> impl IntoResponse {
+    // Fetch accounts from Teller (outside DB lock)
+    let accounts = match teller_get_accounts_api(&body.access_token).await {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))),
+    };
+
+    let conn = state.lock().unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let enrollment_row_id = match conn.execute(
+        "INSERT INTO teller_enrollments
+         (user_id, access_token, enrollment_id, institution_name, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![auth.user_id, body.access_token, body.enrollment_id, body.institution_name, now],
+    ) {
+        Ok(_) => conn.last_insert_rowid(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+
+    let mut account_count = 0;
+    for acct in &accounts {
+        let account_id  = acct["id"].as_str().unwrap_or("");
+        let name        = acct["name"].as_str().unwrap_or("Account");
+        let acct_type   = acct["type"].as_str().unwrap_or("unknown");
+        let last_four   = acct["last_four"].as_str();
+
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO teller_accounts
+             (teller_enrollment_id, user_id, account_id, name, account_type, last_four)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![enrollment_row_id, auth.user_id, account_id, name, acct_type, last_four],
+        );
+        account_count += 1;
+    }
+
+    (StatusCode::CREATED, Json(json!({
+        "message": format!(
+            "Connected {} with {} account(s). Run POST /teller/sync to import transactions.",
+            body.institution_name, account_count
+        ),
+        "accounts": account_count
+    })))
+}
+
+/// POST /teller/sync
+/// Fetches new transactions from every connected account and saves them.
+/// Uses each account's last_transaction_id as a cursor so only new data is pulled.
+async fn teller_sync(
+    auth: AuthUser,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Collect accounts without holding the lock during async Teller calls
+    // (id, access_token, account_id, last_transaction_id, institution_name)
+    let accounts: Vec<(i64, String, String, Option<String>, String)> = {
+        let conn = state.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT ta.id, te.access_token, ta.account_id,
+                    NULLIF(ta.last_transaction_id, ''), te.institution_name
+             FROM teller_accounts ta
+             JOIN teller_enrollments te ON ta.teller_enrollment_id = te.id
+             WHERE ta.user_id = ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        };
+        stmt.query_map(params![auth.user_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    if accounts.is_empty() {
+        return (StatusCode::OK, Json(json!({
+            "message": "No connected banks. Use POST /teller/enroll to connect one first.",
+            "imported": 0
+        })));
+    }
+
+    let mut total_imported = 0;
+
+    for (acct_row_id, access_token, teller_account_id, last_id, institution_name) in accounts {
+        match teller_fetch_transactions(&access_token, &teller_account_id, last_id.as_deref()).await {
+            Ok((records, newest_id)) => {
+                let count = records.len();
+                let conn = state.lock().unwrap();
+                let _ = save_records(&conn, &records, Some(auth.user_id));
+                // Advance cursor to the newest transaction seen
+                if let Some(ref nid) = newest_id {
+                    let _ = conn.execute(
+                        "UPDATE teller_accounts SET last_transaction_id = ?1 WHERE id = ?2",
+                        params![nid, acct_row_id],
+                    );
+                }
+                total_imported += count;
+                eprintln!("[Teller] Synced {} transactions from {}", count, institution_name);
+            }
+            Err(e) => eprintln!("[Teller] Sync error for {}: {}", institution_name, e),
+        }
+    }
+
+    (StatusCode::OK, Json(json!({
+        "message": format!("Synced {} new transaction(s) from connected banks", total_imported),
+        "imported": total_imported
+    })))
+}
+
+/// GET /teller/accounts — list all connected bank accounts.
+async fn get_teller_accounts(auth: AuthUser, State(state): State<AppState>) -> impl IntoResponse {
+    let conn = state.lock().unwrap();
+    let mut stmt = match conn.prepare(
+        "SELECT ta.id, te.institution_name, ta.name, ta.account_type, ta.last_four
+         FROM teller_accounts ta
+         JOIN teller_enrollments te ON ta.teller_enrollment_id = te.id
+         WHERE ta.user_id = ?1
+         ORDER BY te.institution_name, ta.name",
+    ) {
+        Ok(s) => s,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+
+    let accounts: Vec<TellerAccountRow> = stmt
+        .query_map(params![auth.user_id], |row| {
+            Ok(TellerAccountRow {
+                id:               row.get(0)?,
+                institution_name: row.get(1)?,
+                account_name:     row.get(2)?,
+                account_type:     row.get(3)?,
+                last_four:        row.get(4)?,
+            })
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+
+    (StatusCode::OK, Json(json!({ "accounts": accounts })))
+}
+
+/// DELETE /teller/accounts/{id} — disconnect a bank account.
+/// Removes the parent enrollment if it has no remaining accounts.
+async fn teller_disconnect(
+    auth: AuthUser,
+    State(state): State<AppState>,
+    axum::extract::Path(account_id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let conn = state.lock().unwrap();
+
+    let enrollment_id: i64 = match conn.query_row(
+        "SELECT teller_enrollment_id FROM teller_accounts WHERE id = ?1 AND user_id = ?2",
+        params![account_id, auth.user_id],
+        |row| row.get(0),
+    ) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "Account not found" }))),
+    };
+
+    let _ = conn.execute(
+        "DELETE FROM teller_accounts WHERE id = ?1 AND user_id = ?2",
+        params![account_id, auth.user_id],
+    );
+
+    // Remove the enrollment if no accounts remain under it
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM teller_accounts WHERE teller_enrollment_id = ?1",
+            params![enrollment_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(1);
+
+    if remaining == 0 {
+        let _ = conn.execute(
+            "DELETE FROM teller_enrollments WHERE id = ?1 AND user_id = ?2",
+            params![enrollment_id, auth.user_id],
+        );
+    }
+
+    (StatusCode::OK, Json(json!({ "message": "Bank account disconnected" })))
+}
+
 // ── Database setup ────────────────────────────────────────────────────────────
 
 fn create_db() -> Result<Connection, Box<dyn std::error::Error>> {
@@ -652,6 +1015,33 @@ fn create_db() -> Result<Connection, Box<dyn std::error::Error>> {
             amount      REAL NOT NULL,
             entry_type  TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT ''
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS teller_enrollments (
+            id               INTEGER PRIMARY KEY,
+            user_id          INTEGER NOT NULL REFERENCES users(id),
+            access_token     TEXT NOT NULL,
+            enrollment_id    TEXT NOT NULL,
+            institution_name TEXT NOT NULL,
+            created_at       TEXT NOT NULL
+        )",
+        [],
+    )?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS teller_accounts (
+            id                    INTEGER PRIMARY KEY,
+            teller_enrollment_id  INTEGER NOT NULL REFERENCES teller_enrollments(id),
+            user_id               INTEGER NOT NULL REFERENCES users(id),
+            account_id            TEXT NOT NULL,
+            name                  TEXT NOT NULL,
+            account_type          TEXT NOT NULL,
+            last_four             TEXT,
+            last_transaction_id   TEXT,
+            UNIQUE(account_id, user_id)
         )",
         [],
     )?;
@@ -1330,6 +1720,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/account/password",  axum::routing::put(change_password))
         .route("/cash",              post(add_cash_entry).get(get_cash_entries))
         .route("/cash/{id}",         axum::routing::delete(delete_cash_entry))
+        // Teller bank connection
+        .route("/teller/enroll",       post(teller_enroll))
+        .route("/teller/sync",         post(teller_sync))
+        .route("/teller/accounts",     get(get_teller_accounts))
+        .route("/teller/accounts/{id}", axum::routing::delete(teller_disconnect))
         .with_state(state)
         .layer(CorsLayer::permissive());
 
@@ -1338,6 +1733,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  POST /register | POST /login");
     println!("  GET  /summary | GET /transactions | GET /analytics  (Bearer token)");
     println!("  POST /upload | POST /cash | GET /cash | DELETE /cash/:id  (Bearer token)");
+    println!("  --- Bank connection (Teller) ---");
+    println!("  POST /teller/enroll        → store enrollment after Teller Connect flow");
+    println!("  POST /teller/sync          → pull latest transactions from connected banks");
+    println!("  GET  /teller/accounts      → list connected bank accounts");
+    println!("  DELETE /teller/accounts/:id → disconnect a bank account");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
