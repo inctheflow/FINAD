@@ -28,6 +28,9 @@ struct Record {
     description: String,
     #[serde(default)]
     category: String,
+    /// Teller transaction ID — Some only for bank-synced records.
+    #[serde(skip)]
+    teller_id: Option<String>,
 }
 
 // ── Auth structs ──────────────────────────────────────────────────────────────
@@ -198,6 +201,43 @@ fn discover_date(date: &str) -> String {
 
 fn categorize(description: &str) -> String {
     let rules: &[(&str, &str)] = &[
+        // ── Credit-card / loan payments — checked first, excluded from spending
+        ("online payment",            "payment"),
+        ("credit card payment",       "payment"),
+        ("autopay",                   "payment"),
+        ("auto pay",                  "payment"),
+        ("auto-pay",                  "payment"),
+        ("e-payment",                 "payment"),
+        ("epayment",                  "payment"),
+        ("bill payment",              "payment"),
+        ("bill pay",                  "payment"),
+        ("web payment",               "payment"),
+        ("web pay",                   "payment"),
+        ("online pmt",                "payment"),
+        ("credit pmt",                "payment"),
+        ("payment - thank you",       "payment"),
+        ("payment thank you",         "payment"),
+        ("thank you payment",         "payment"),
+        ("loan payment",              "payment"),
+        ("student loan",              "payment"),
+        ("mortgage payment",          "payment"),
+        // Major issuer payment patterns (as seen in checking-account debits)
+        ("discover e-pay",            "payment"),
+        ("discover payment",          "payment"),
+        ("amex epay",                 "payment"),
+        ("amex payment",              "payment"),
+        ("american express epay",     "payment"),
+        ("american express payment",  "payment"),
+        ("chase autopay",             "payment"),
+        ("chase credit card",         "payment"),
+        ("citi autopay",              "payment"),
+        ("citi payment",              "payment"),
+        ("capital one autopay",       "payment"),
+        ("capital one pmt",           "payment"),
+        ("synchrony payment",         "payment"),
+        ("barclays payment",          "payment"),
+        ("wells fargo payment",       "payment"),
+        ("bank of america payment",   "payment"),
         // ── Dining ───────────────────────────────────────────────────────────
         ("akira ramen",         "dining"),
         ("swadesh",             "dining"),
@@ -555,7 +595,7 @@ async fn claude_extract_transactions(text: &str) -> Result<Vec<Record>, String> 
                         })?;
                     if amount <= 0.0 { return None; }
                     let category = categorize(&description);
-                    Some(Record { date, description, amount, category })
+                    Some(Record { date, description, amount, category, teller_id: None })
                 })
                 .collect();
             Ok(records)
@@ -574,7 +614,7 @@ fn read_pdf(file_path: &str) -> Result<Vec<Record>, Box<dyn std::error::Error>> 
         let description = cap[2].trim().to_string();
         let amount: f64 = cap[3].replace(",", "").parse()?;
         let category = categorize(&description);
-        records.push(Record { date, amount, description, category });
+        records.push(Record { date, amount, description, category, teller_id: None });
     }
     Ok(records)
 }
@@ -604,7 +644,7 @@ async fn extract_records(file_path: &str) -> Result<Vec<Record>, String> {
             if amount <= 0.0 { return None; }
             let description = cap[2].trim().to_string();
             let category = categorize(&description);
-            Some(Record { date: cap[1].to_string(), amount, description, category })
+            Some(Record { date: cap[1].to_string(), amount, description, category, teller_id: None })
         })
         .collect();
 
@@ -622,7 +662,7 @@ async fn extract_records(file_path: &str) -> Result<Vec<Record>, String> {
             let description = cap[2].split_whitespace().collect::<Vec<_>>().join(" ");
             let category = categorize(&description);
             let date = discover_date(&cap[1]);
-            Some(Record { date, amount, description, category })
+            Some(Record { date, amount, description, category, teller_id: None })
         })
         .collect();
 
@@ -764,7 +804,7 @@ async fn teller_fetch_transactions(
                 .unwrap_or("Unknown")
                 .to_uppercase();
             let category = categorize(&description);
-            all_records.push(Record { date, amount, description, category });
+            all_records.push(Record { date, amount, description, category, teller_id: Some(id) });
         }
 
         if stop || page_len < 100 {
@@ -883,9 +923,9 @@ async fn teller_sync(
     for (acct_row_id, access_token, teller_account_id, last_id, institution_name) in accounts {
         match teller_fetch_transactions(&access_token, &teller_account_id, last_id.as_deref()).await {
             Ok((records, newest_id)) => {
-                let count = records.len();
                 let conn = state.lock().unwrap();
-                let _ = save_records(&conn, &records, Some(auth.user_id));
+                let upserted = save_teller_records(&conn, &records, auth.user_id)
+                    .unwrap_or(records.len());
                 // Advance cursor to the newest transaction seen
                 if let Some(ref nid) = newest_id {
                     let _ = conn.execute(
@@ -893,8 +933,8 @@ async fn teller_sync(
                         params![nid, acct_row_id],
                     );
                 }
-                total_imported += count;
-                eprintln!("[Teller] Synced {} transactions from {}", count, institution_name);
+                total_imported += upserted;
+                eprintln!("[Teller] Upserted {} transactions from {}", upserted, institution_name);
             }
             Err(e) => eprintln!("[Teller] Sync error for {}: {}", institution_name, e),
         }
@@ -1046,6 +1086,16 @@ fn create_db() -> Result<Connection, Box<dyn std::error::Error>> {
         [],
     )?;
 
+    // Add teller_id column for bank-synced transactions (safe to call repeatedly)
+    let _ = conn.execute("ALTER TABLE transactions ADD COLUMN teller_id TEXT", []);
+    // Unique index so each Teller transaction is stored exactly once per user
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tx_teller_id
+         ON transactions(teller_id, user_id)
+         WHERE teller_id IS NOT NULL",
+        [],
+    );
+
     // Add new user profile columns (safe to call repeatedly — errors ignored)
     let _ = conn.execute("ALTER TABLE users ADD COLUMN phone TEXT", []);
     let _ = conn.execute("ALTER TABLE users ADD COLUMN security_question TEXT", []);
@@ -1114,6 +1164,36 @@ fn save_records(
         )?;
     }
     Ok(())
+}
+
+/// Upsert Teller-sourced records keyed on teller_id.
+/// - New transactions are inserted.
+/// - Existing ones have their category updated in case categorize() rules changed.
+/// - Content-based dedup (date+desc+amount) is still the fallback for records
+///   without a teller_id.
+fn save_teller_records(
+    conn: &Connection,
+    records: &[Record],
+    user_id: i64,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut inserted = 0usize;
+    for record in records {
+        let rows = conn.execute(
+            "INSERT INTO transactions (date, amount, description, category, user_id, teller_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(teller_id, user_id) DO UPDATE SET
+               category    = excluded.category,
+               date        = excluded.date,
+               amount      = excluded.amount,
+               description = excluded.description",
+            params![
+                record.date, record.amount, record.description,
+                record.category, user_id, record.teller_id
+            ],
+        )?;
+        inserted += rows;
+    }
+    Ok(inserted)
 }
 
 fn build_summary(conn: &Connection, user_id: i64) -> Result<String, Box<dyn std::error::Error>> {
@@ -1327,6 +1407,7 @@ async fn get_transactions(auth: AuthUser, State(state): State<AppState>) -> impl
                 description: row.get(1)?,
                 amount: row.get(2)?,
                 category: row.get(3)?,
+                teller_id: None,
             })
         })
         .unwrap()
