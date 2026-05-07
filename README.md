@@ -84,7 +84,7 @@ Create a `.env` file in the `finad/` directory:
 
 ```env
 ANTHROPIC_API_KEY=sk-ant-...
-JWT_SECRET=your_random_secret_here
+JWT_SECRET=your_random_secret_here   # Required — server warns loudly if missing
 ```
 
 ### Run the backend
@@ -183,11 +183,11 @@ CREATE TABLE users (
 |---|---|---|
 | `POST` | `/register` | Create account |
 | `POST` | `/login` | Get JWT token |
-| `GET` | `/transactions` | List all transactions |
+| `GET` | `/transactions` | List transactions (most recent 500) |
 | `POST` | `/upload` | Upload PDF statement |
 | `GET` | `/analytics` | Spending analytics |
 | `GET` | `/summary` | Text spending summary |
-| `POST` | `/chat` | AI chat (Claude) |
+| `POST` | `/chat` | AI chat (Claude, max 2000 chars) |
 | `GET` | `/cash` | List cash entries |
 | `POST` | `/cash` | Add cash entry |
 | `DELETE` | `/cash/:id` | Delete cash entry |
@@ -224,6 +224,9 @@ Your financial data stays local — stored in `transactions.db` on your machine.
 - [x] Teller upsert keyed on transaction ID
 - [x] Manual cash entry tracking
 - [x] Web dashboard (React + Recharts)
+- [x] Transaction list capped at 500 (most recent) to prevent memory issues
+- [x] Chat message size limit (2000 chars) to prevent API abuse
+- [x] JWT_SECRET warning on startup if env var is not set
 - [ ] Support for more PDF formats (Chase, Bank of America, etc.)
 - [ ] Recurring charge detection
 - [ ] Budget setting and alerts
