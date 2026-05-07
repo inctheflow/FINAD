@@ -90,7 +90,10 @@ where
             Json(json!({"error": "Invalid Authorization format, expected: Bearer <token>"})),
         ))?;
 
-        let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "change_me_in_production".to_string());
+        let secret = env::var("JWT_SECRET").unwrap_or_else(|_| {
+            eprintln!("WARNING: JWT_SECRET not set — using insecure default. Set JWT_SECRET in your environment.");
+            "change_me_in_production".to_string()
+        });
 
         let token_data = decode::<Claims>(
             token,
@@ -111,7 +114,10 @@ where
 // ── JWT helper ────────────────────────────────────────────────────────────────
 
 fn create_token(user_id: i64) -> Result<String, jsonwebtoken::errors::Error> {
-    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| "change_me_in_production".to_string());
+    let secret = env::var("JWT_SECRET").unwrap_or_else(|_| {
+        eprintln!("WARNING: JWT_SECRET not set — using insecure default. Set JWT_SECRET in your environment.");
+        "change_me_in_production".to_string()
+    });
     let exp = chrono::Utc::now()
         .checked_add_signed(chrono::Duration::days(7))
         .expect("valid timestamp")
@@ -1272,7 +1278,7 @@ fn build_summary(conn: &Connection, user_id: i64) -> Result<String, Box<dyn std:
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, f64>(2)?))
     })? {
         let (desc, visits, total) = row?;
-        let short = if desc.len() > 40 { &desc[..40] } else { &desc };
+        let short: String = desc.chars().take(40).collect();
         summary.push_str(&format!("  {:<40}  {}x  ${:.2}\n", short, visits, total));
     }
 
@@ -1292,7 +1298,7 @@ fn build_summary(conn: &Connection, user_id: i64) -> Result<String, Box<dyn std:
         ))
     })? {
         let (date, desc, amount, cat) = row?;
-        let short = if desc.len() > 35 { &desc[..35] } else { &desc };
+        let short: String = desc.chars().take(35).collect();
         summary.push_str(&format!(
             "  {}  ${:>8.2}  {:<15}  {}\n",
             date, amount, cat, short
@@ -1394,7 +1400,7 @@ async fn get_transactions(auth: AuthUser, State(state): State<AppState>) -> impl
     let conn = state.lock().unwrap();
     let mut stmt = match conn.prepare(
         "SELECT date, description, amount, category FROM transactions
-         WHERE user_id = ?1 ORDER BY date DESC",
+         WHERE user_id = ?1 ORDER BY date DESC LIMIT 500",
     ) {
         Ok(s) => s,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
@@ -1565,6 +1571,10 @@ async fn chat(
     State(state): State<AppState>,
     Json(body): Json<ChatRequest>,
 ) -> impl IntoResponse {
+    if body.message.len() > 2_000 {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "Message too long (max 2000 characters)"})));
+    }
+
     let context = {
         let conn = state.lock().unwrap();
         build_summary(&conn, auth.user_id).unwrap_or_else(|_| "No transaction data available.".to_string())
